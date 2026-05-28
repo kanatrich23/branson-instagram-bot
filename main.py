@@ -12,33 +12,47 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8787132108:AAHXnoY38-
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "-1003764501174")
 
 STATE_FILE = "state.json"
-CHECK_INTERVAL = 1800
+BACKFILL_LIMIT = 200        # берём все посты (с запасом)
+INTERVAL_BACKFILL = 3600    # 1 час между постами при заполнении
+INTERVAL_MONITOR = 1800     # 30 минут при мониторинге новых
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    return {"last_post_id": None}
+    return {
+        "last_post_id": None,
+        "backfill_done": False,
+        "backfill_queue": [],
+        "backfill_posts_data": {}
+    }
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-def get_latest_posts(limit=5):
-    # Новый Instagram Login API использует /me/media
+def get_all_posts(limit=200):
+    """Получить все посты постранично"""
+    all_posts = []
     url = "https://graph.instagram.com/me/media"
     params = {
         "fields": "id,caption,media_type,media_url,thumbnail_url,timestamp,permalink",
-        "limit": limit,
+        "limit": 25,
         "access_token": IG_ACCESS_TOKEN
     }
-    resp = requests.get(url, params=params)
-    data = resp.json()
-    if "data" in data:
-        return data["data"]
-    else:
-        logger.error(f"❌ Ошибка получения постов: {data}")
-        return []
+    while len(all_posts) < limit:
+        resp = requests.get(url, params=params)
+        data = resp.json()
+        if "data" not in data:
+            logger.error(f"❌ Ошибка получения постов: {data}")
+            break
+        all_posts.extend(data["data"])
+        next_cursor = data.get("paging", {}).get("cursors", {}).get("after")
+        if not next_cursor:
+            break
+        params["after"] = next_cursor
+        time.sleep(1)
+    return all_posts[:limit]
 
 def send_photo(caption, image_url):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -97,43 +111,111 @@ def main():
         return
 
     state = load_state()
-    last_post_id = state.get("last_post_id")
 
-    while True:
-        try:
-            posts = get_latest_posts()
+    # ============================================================
+    # РЕЖИМ 1: ЗАПОЛНЕНИЕ — публикуем все старые посты (1 в час)
+    # ============================================================
+    if not state.get("backfill_done"):
 
-            if posts:
+        # Загружаем все посты если очередь пустая
+        if not state.get("backfill_queue"):
+            logger.info(f"📥 Загружаем все посты из Instagram...")
+            posts = get_all_posts(BACKFILL_LIMIT)
+            logger.info(f"📊 Найдено постов: {len(posts)}")
+
+            # От старых к новым
+            queue = [p["id"] for p in reversed(posts)]
+            posts_data = {p["id"]: p for p in posts}
+
+            # Убираем уже опубликованный пост
+            last_id = state.get("last_post_id")
+            if last_id and last_id in queue:
+                idx = queue.index(last_id)
+                queue = queue[idx+1:]
+
+            state["backfill_queue"] = queue
+            state["backfill_posts_data"] = posts_data
+            save_state(state)
+            logger.info(f"📋 В очереди {len(queue)} постов. Темп: 20/день (каждый час)")
+
+        queue = state.get("backfill_queue", [])
+        posts_data = state.get("backfill_posts_data", {})
+
+        if queue:
+            post_id = queue[0]
+            post = posts_data.get(post_id)
+
+            if post:
+                logger.info(f"📤 Публикуем пост {post_id} (осталось в очереди: {len(queue)})")
+                result = post_to_telegram(post)
+                if result.get("ok"):
+                    logger.info(f"✅ Опубликован. Осталось: {len(queue)-1}")
+                    state["backfill_queue"] = queue[1:]
+                    state["last_post_id"] = post_id
+                    save_state(state)
+                else:
+                    logger.error(f"❌ Ошибка публикации: {result}")
+                    state["backfill_queue"] = queue[1:]
+                    save_state(state)
+            else:
+                state["backfill_queue"] = queue[1:]
+                save_state(state)
+
+            remaining = len(state["backfill_queue"])
+            if remaining == 0:
+                logger.info("🎉 Все посты опубликованы! Переключаемся на мониторинг.")
+                state["backfill_done"] = True
+                save_state(state)
+            else:
+                days_left = remaining / 20
+                logger.info(f"⏳ Осталось постов: {remaining} (~{days_left:.1f} дней). Следующий через 1 час.")
+                time.sleep(INTERVAL_BACKFILL)
+                main()  # рекурсивно продолжаем
+        else:
+            state["backfill_done"] = True
+            save_state(state)
+            main()
+
+    # ============================================================
+    # РЕЖИМ 2: МОНИТОРИНГ — проверяем новые посты каждые 30 минут
+    # ============================================================
+    else:
+        logger.info("👁 Режим мониторинга новых постов")
+        while True:
+            try:
+                resp = requests.get("https://graph.instagram.com/me/media", params={
+                    "fields": "id,caption,media_type,media_url,thumbnail_url,timestamp,permalink",
+                    "limit": 5,
+                    "access_token": IG_ACCESS_TOKEN
+                })
+                data = resp.json()
+                posts = data.get("data", [])
+
+                last_post_id = state.get("last_post_id")
                 new_posts = []
                 for post in posts:
                     if post["id"] == last_post_id:
                         break
                     new_posts.append(post)
 
-                if not last_post_id:
-                    new_posts = [posts[0]] if posts else []
-                    logger.info("🆕 Первый запуск — публикуем последний пост")
+                if new_posts:
+                    for post in reversed(new_posts):
+                        logger.info(f"📤 Новый пост: {post['id']}")
+                        result = post_to_telegram(post)
+                        if result.get("ok"):
+                            logger.info("✅ Опубликован в Telegram")
+                            state["last_post_id"] = post["id"]
+                            save_state(state)
+                        time.sleep(2)
+                else:
+                    logger.info("📭 Новых постов нет")
 
-                for post in reversed(new_posts):
-                    logger.info(f"📤 Публикуем пост {post['id']}...")
-                    result = post_to_telegram(post)
-                    if result.get("ok"):
-                        logger.info("✅ Пост опубликован в Telegram")
-                        last_post_id = post["id"]
-                        state["last_post_id"] = last_post_id
-                        save_state(state)
-                    else:
-                        logger.error(f"❌ Ошибка публикации: {result}")
-                    time.sleep(2)
-            else:
-                logger.info("📭 Новых постов нет")
+                logger.info(f"⏳ Следующая проверка через 30 минут")
+                time.sleep(INTERVAL_MONITOR)
 
-            logger.info(f"⏳ Следующая проверка через {CHECK_INTERVAL // 60} минут")
-            time.sleep(CHECK_INTERVAL)
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-            time.sleep(60)
+            except Exception as e:
+                logger.error(f"❌ Ошибка: {e}")
+                time.sleep(60)
 
 if __name__ == "__main__":
     main()
