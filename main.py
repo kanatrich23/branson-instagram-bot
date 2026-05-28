@@ -23,7 +23,7 @@ OLD_NUMBERS = [
     '+77767485353', '+77763653553', '+77767345353',
 ]
 
-NEW_PHONE_BLOCK = "Наши телефоны:\n+7 776 735 5353 WhatsApp"
+NEW_PHONE_BLOCK = 'Контакты:\n📱 <a href="https://wa.me/77767355353">WhatsApp: +7 776 735 5353</a>\n🌐 <a href="https://branson-recruitment.kz">branson-recruitment.kz</a>'
 
 def clean_caption(text):
     if not text:
