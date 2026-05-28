@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import re
 import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -12,9 +13,55 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8787132108:AAHXnoY38-
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "-1003764501174")
 
 STATE_FILE = "state.json"
-BACKFILL_LIMIT = 200        # берём все посты (с запасом)
-INTERVAL_BACKFILL = 3600    # 1 час между постами при заполнении
-INTERVAL_MONITOR = 1800     # 30 минут при мониторинге новых
+BACKFILL_LIMIT = 200
+INTERVAL_BACKFILL = 3600
+INTERVAL_MONITOR = 1800
+
+# Старые номера в любом формате
+OLD_NUMBERS = [
+    '77767485353', '77763653553', '77767345353',
+    '+77767485353', '+77763653553', '+77767345353',
+]
+
+NEW_PHONE_BLOCK = "Наши телефоны:\n+7 776 735 5353 WhatsApp"
+
+def clean_caption(text):
+    if not text:
+        return text
+
+    # Проверяем есть ли старые номера в тексте
+    has_old_numbers = any(num.replace('+', '') in text.replace(' ', '').replace('-', '') 
+                         for num in OLD_NUMBERS)
+
+    cleaned = text
+
+    # Удаляем строки содержащие старые номера (вместе с именами)
+    lines = cleaned.split('\n')
+    new_lines = []
+    skip_next = False
+    for line in lines:
+        line_clean = line.replace(' ', '').replace('-', '').replace('+', '')
+        is_old_number_line = any(num.replace('+', '') in line_clean for num in OLD_NUMBERS)
+        
+        if is_old_number_line:
+            continue  # пропускаем строку со старым номером
+        new_lines.append(line)
+
+    cleaned = '\n'.join(new_lines)
+
+    # Удаляем заголовок "Наши телефоны:" если остался пустым
+    cleaned = re.sub(r'Наши телефоны:?\s*\n\n', '', cleaned)
+    cleaned = re.sub(r'Наши телефоны:?\s*$', '', cleaned, flags=re.MULTILINE)
+
+    # Убираем лишние пустые строки
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = cleaned.strip()
+
+    # Если были старые номера — добавляем новый номер
+    if has_old_numbers:
+        cleaned = cleaned + f"\n\n{NEW_PHONE_BLOCK}"
+
+    return cleaned
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -32,7 +79,6 @@ def save_state(state):
         json.dump(state, f)
 
 def get_all_posts(limit=200):
-    """Получить все посты постранично"""
     all_posts = []
     url = "https://graph.instagram.com/me/media"
     params = {
@@ -87,7 +133,9 @@ def post_to_telegram(post):
     media_type = post.get("media_type", "IMAGE")
     caption = post.get("caption", "")
     permalink = post.get("permalink", "")
-    full_caption = f"{caption}\n\n🔗 <a href='{permalink}'>Смотреть в Instagram</a>" if permalink else caption
+
+    cleaned = clean_caption(caption)
+    full_caption = f"{cleaned}\n\n🔗 <a href='{permalink}'>Смотреть в Instagram</a>" if permalink else cleaned
 
     if media_type == "IMAGE":
         image_url = post.get("media_url")
@@ -112,22 +160,15 @@ def main():
 
     state = load_state()
 
-    # ============================================================
-    # РЕЖИМ 1: ЗАПОЛНЕНИЕ — публикуем все старые посты (1 в час)
-    # ============================================================
     if not state.get("backfill_done"):
-
-        # Загружаем все посты если очередь пустая
         if not state.get("backfill_queue"):
-            logger.info(f"📥 Загружаем все посты из Instagram...")
+            logger.info("📥 Загружаем все посты из Instagram...")
             posts = get_all_posts(BACKFILL_LIMIT)
             logger.info(f"📊 Найдено постов: {len(posts)}")
 
-            # От старых к новым
             queue = [p["id"] for p in reversed(posts)]
             posts_data = {p["id"]: p for p in posts}
 
-            # Убираем уже опубликованный пост
             last_id = state.get("last_post_id")
             if last_id and last_id in queue:
                 idx = queue.index(last_id)
@@ -146,7 +187,7 @@ def main():
             post = posts_data.get(post_id)
 
             if post:
-                logger.info(f"📤 Публикуем пост {post_id} (осталось в очереди: {len(queue)})")
+                logger.info(f"📤 Публикуем пост {post_id} (осталось: {len(queue)})")
                 result = post_to_telegram(post)
                 if result.get("ok"):
                     logger.info(f"✅ Опубликован. Осталось: {len(queue)-1}")
@@ -154,7 +195,7 @@ def main():
                     state["last_post_id"] = post_id
                     save_state(state)
                 else:
-                    logger.error(f"❌ Ошибка публикации: {result}")
+                    logger.error(f"❌ Ошибка: {result}")
                     state["backfill_queue"] = queue[1:]
                     save_state(state)
             else:
@@ -168,17 +209,14 @@ def main():
                 save_state(state)
             else:
                 days_left = remaining / 20
-                logger.info(f"⏳ Осталось постов: {remaining} (~{days_left:.1f} дней). Следующий через 1 час.")
+                logger.info(f"⏳ Осталось: {remaining} (~{days_left:.1f} дней). Следующий через 1 час.")
                 time.sleep(INTERVAL_BACKFILL)
-                main()  # рекурсивно продолжаем
+                main()
         else:
             state["backfill_done"] = True
             save_state(state)
             main()
 
-    # ============================================================
-    # РЕЖИМ 2: МОНИТОРИНГ — проверяем новые посты каждые 30 минут
-    # ============================================================
     else:
         logger.info("👁 Режим мониторинга новых постов")
         while True:
@@ -188,9 +226,7 @@ def main():
                     "limit": 5,
                     "access_token": IG_ACCESS_TOKEN
                 })
-                data = resp.json()
-                posts = data.get("data", [])
-
+                posts = resp.json().get("data", [])
                 last_post_id = state.get("last_post_id")
                 new_posts = []
                 for post in posts:
@@ -210,7 +246,7 @@ def main():
                 else:
                     logger.info("📭 Новых постов нет")
 
-                logger.info(f"⏳ Следующая проверка через 30 минут")
+                logger.info("⏳ Следующая проверка через 30 минут")
                 time.sleep(INTERVAL_MONITOR)
 
             except Exception as e:
