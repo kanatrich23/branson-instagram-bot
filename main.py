@@ -7,20 +7,13 @@ import requests
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# КОНФИГУРАЦИЯ
-# ============================================================
-IG_USER_ID = os.environ.get("IG_USER_ID", "17841401410456472")
 IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8787132108:AAHXnoY38-SwxpJ3oU0O2tFCU5jiI7rZRRg")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "-1003764501174")
 
 STATE_FILE = "state.json"
-CHECK_INTERVAL = 1800  # 30 минут
+CHECK_INTERVAL = 1800
 
-# ============================================================
-# СОСТОЯНИЕ
-# ============================================================
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
@@ -31,11 +24,9 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-# ============================================================
-# INSTAGRAM API
-# ============================================================
 def get_latest_posts(limit=5):
-    url = f"https://graph.instagram.com/v22.0/{IG_USER_ID}/media"
+    # Новый Instagram Login API использует /me/media
+    url = "https://graph.instagram.com/me/media"
     params = {
         "fields": "id,caption,media_type,media_url,thumbnail_url,timestamp,permalink",
         "limit": limit,
@@ -49,9 +40,6 @@ def get_latest_posts(limit=5):
         logger.error(f"❌ Ошибка получения постов: {data}")
         return []
 
-# ============================================================
-# TELEGRAM API
-# ============================================================
 def send_photo(caption, image_url):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     payload = {
@@ -101,9 +89,6 @@ def post_to_telegram(post):
             return send_photo(full_caption + "\n📸 Карусель — смотрите все фото в Instagram", image_url)
     return send_message(full_caption)
 
-# ============================================================
-# ОСНОВНОЙ ЦИКЛ
-# ============================================================
 def main():
     logger.info("🚀 Branson Social Bot запущен")
 
